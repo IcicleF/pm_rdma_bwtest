@@ -1,5 +1,6 @@
-/*
+/**
  * Changing DDIO State
+ * WARNING: Not effective for 3rd Gen Intel Xeon processors!!!
  *
  * Copyright (c) 2020, Alireza Farshin, KTH Royal Institute of Technology - All
  * Rights Reserved

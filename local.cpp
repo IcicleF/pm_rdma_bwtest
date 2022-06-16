@@ -1,31 +1,30 @@
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
+#include <thread>
+#include <atomic>
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <errno.h>
-#include <thread>
-#include <chrono>
 
-#include "rlibv2/lib.hh"
-#include "common.h"
+#include "persist.h"
 
-using namespace rdmaio;
-using namespace rdmaio::rmem;
-using namespace rdmaio::qp;
+using u8 = uint8_t;
+using u16 = uint16_t;
+using u32 = uint32_t;
+using u64 = uint64_t;
 
-static const int QpTimeout = 2;
-static const size_t LocalMemSize = 1ul << 30;
-
+static char const *PmDev = "/dev/dax0.0";
+static const size_t PageSize = 2ul << 20;
+static const u64 MemSize = 128ul << 30;
 static const int MaxNThreads = 8;
 static int NThreads = 1;
 static u32 Granularity = 64;
 
 static const int NTests = 10000000;
-static const int Batch = 8;
-static const auto IOMode = IBV_WR_RDMA_WRITE;
 
-Arc<RC> qps[MaxNThreads];
 u64 thpt[MaxNThreads] = {0};
 
 void parse_inargs(int argc, char **argv)
@@ -60,39 +59,24 @@ inline void bind_core(uint16_t core)
 
 std::atomic_int barrier = 0;
 
-void worker(int id, u8 *buf)
+void worker(int id, u8 *pm)
 {
     bind_core(id);
+    u8 *local = new u8[Granularity];
 
     // Barrier
     barrier.fetch_add(1);
     while (barrier.load() != NThreads + 1);
 
-    const size_t Units = (ServerMemSize / NThreads) / Granularity;
+    const size_t Units = (MemSize / NThreads) / Granularity;
     const size_t Base = Units * Granularity * id;
-    for (int i = 0; i < NTests + Batch; ++i) {
-        if (i < NTests) {
-            qps[id]->send_normal(
-                {
-                    .op = IOMode,
-                    .flags = (i + 1) % Batch == 0 ? IBV_SEND_SIGNALED : 0,
-                    .len = Granularity,
-                    .wr_id = 0
-                },
-                {
-                    .local_addr = reinterpret_cast<RMem::raw_ptr_t>(buf + (i % (Batch * 2)) * Granularity),
-                    .remote_addr = Base + (i % Units) * Granularity,
-                    .imm_data = 0
-                }
-            );
-        }
-        if (i >= Batch && (i + 1) % Batch == 0) {
-            qps[id]->wait_one_comp();
-            thpt[id] += Batch;
-        }
+    for (int i = 0; i < NTests; ++i) {
+        memmove_movnt_avx512f_clwb((char *)(pm + Base + (i % Units) * Granularity), (char *)local, Granularity);
+        thpt[id]++;
     }
 
     barrier.fetch_sub(1);
+    delete[] local;
 }
 
 int main(int argc, char **argv)
@@ -100,40 +84,20 @@ int main(int argc, char **argv)
     parse_inargs(argc, argv);
     bind_core(MaxNThreads);
 
-    auto nic = RNic::create(RNicInfo::query_dev_names().at(UseNixIdx)).value();
-    for (int i = 0; i < NThreads; ++i)
-        qps[i] = RC::create(nic, QPConfig().set_timeout(QpTimeout)).value();
-
-    ConnectManager cm(ServerAddr);
-    if (cm.wait_ready(1000000, 2) == IOCode::Timeout) {
-        fprintf(stderr, "connection timed out.\n");
+    int fd = open("/dev/dax0.0", O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "cannot open %s: %s\n", PmDev, strerror(errno));
         exit(-1);
     }
-
-    auto aligned_alloc_fn = [](u64 size) -> RMem::raw_ptr_t {
-        void *buf = nullptr;
-        int rc = posix_memalign(&buf, 4096, size);
-        if (rc)
-            return 0;
-        return reinterpret_cast<RMem::raw_ptr_t>(buf);
-    };
-    auto local_mem = Arc<RMem>(new RMem(LocalMemSize * NThreads, aligned_alloc_fn));
-    auto local_mr = RegHandler::create(local_mem, nic).value();
-    u8 *local_buf = (u8 *)(local_mem->raw_ptr);
-    
-    auto fetch_res = cm.fetch_remote_mr(RegMemName);
-    rmem::RegAttr remote_attr = std::get<1>(fetch_res.desc);
-
-    for (int i = 0; i < NThreads; ++i) {
-        cm.cc_rc("client-qp" + std::to_string(i), qps[i], RegNicName, QPConfig().set_timeout(QpTimeout));
-
-        qps[i]->bind_remote_mr(remote_attr);
-        qps[i]->bind_local_mr(local_mr->get_reg_attr().value());
+    void *pmbuf = mmap(nullptr, MemSize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pmbuf == (void *)-1) {
+        fprintf(stderr, "cannot mmap: %s\n", strerror(errno));
+        exit(-1);
     }
 
     std::thread workers[MaxNThreads];
     for (int i = 0; i < NThreads; ++i)
-        workers[i] = std::thread(worker, i, local_buf + i * LocalMemSize);
+        workers[i] = std::thread(worker, i, (u8 *)pmbuf);
 
     barrier.fetch_add(1);
     while (barrier.load() != NThreads + 1);
